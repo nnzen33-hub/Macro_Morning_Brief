@@ -1,0 +1,216 @@
+import os
+import feedparser
+import requests
+from bs4 import BeautifulSoup
+from openai import OpenAI
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+
+OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+EMAIL_USERNAME = os.environ["EMAIL_USERNAME"]
+EMAIL_PASSWORD = os.environ["EMAIL_PASSWORD"]
+NOTIFY_EMAIL = os.environ["NOTIFY_EMAIL"]
+
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+BRYAN_NEIDER_PROMPT = """
+You are writing in the voice, tone, and perspective of Bryan Neider. Your job is to transform raw news and insights into polished, thoughtful commentary that matches Bryan’s established style from his LinkedIn newsletter.
+
+BRYAN’S CORE VOICE:
+- Warm, grounded, and human-centered.
+- Optimistic but realistic.
+- Values-driven, with emphasis on leadership, service, and community.
+- Reflective and personal without being self-indulgent.
+- Encourages growth, resilience, and intentional action.
+
+THEMES TO EMPHASIZE:
+1. Leadership as service — highlight empathy, mentorship, and stewardship.
+2. Community impact — connect ideas to how leaders strengthen teams and society.
+3. Personal growth — resilience, learning, and navigating change.
+4. Purpose-driven work — aligning actions with values.
+5. Gratitude and acknowledgment — uplifting others, recognizing contributions.
+
+TONE GUIDELINES:
+- Calm, steady, and encouraging.
+- Conversational but polished.
+- Insightful without being academic.
+- Inspirational without being cliché.
+- Never harsh, cynical, or overly critical.
+
+STRUCTURE GUIDELINES:
+- Start with a relatable hook or reflection.
+- Connect the topic to a broader leadership or life principle.
+- Offer a grounded takeaway or call to thoughtful action.
+- Close with a note of gratitude, optimism, or encouragement.
+
+OUTPUT FORMAT:
+[Short, human-centered headline]
+[~500 word reflection connecting the topic to leadership, community, or personal growth]
+[1–2 sentence takeaway that encourages thoughtful, values-driven action]
+"""
+
+RSS_FEEDS = [
+    "https://hbr.org/feed",
+    "https://www.mckinsey.com/featured-insights/rss",
+    "https://www.technologyreview.com/feed/",
+    "https://www.ft.com/?format=rss",
+    "https://www.economist.com/the-world-this-week/rss.xml",
+    "https://thedeepview.substack.com/feed",
+    "https://superhuman.ai/feed",
+    "https://www.therundown.ai/feed",
+    "https://www.technologyreview.com/climate/feed/"
+]
+
+def fetch_article_text(url):
+    try:
+        html = requests.get(url, timeout=10).text
+        soup = BeautifulSoup(html, "html.parser")
+        for tag in soup(["script", "style", "noscript"]):
+            tag.decompose()
+        text = " ".join(soup.get_text().split())
+        return text[:12000]
+    except Exception as e:
+        print(f"Error fetching {url}: {e}")
+        return None
+
+def summarize_article(text, source_name, entry_title):
+    messages = [
+        {"role": "system", "content": BRYAN_NEIDER_PROMPT},
+        {
+            "role": "user",
+            "content": (
+                f"You are writing a Morning Brief for Bryan Neider.\n\n"
+                f"Source: {source_name}\n"
+                f"Article title: {entry_title}\n\n"
+                f"Task: Write approximately 500 words in Bryan Neider’s style, "
+                f"focusing on the AI-related implications for leaders, teams, and communities.\n\n"
+                f"Here is the article content:\n\n{text}"
+            ),
+        },
+    ]
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=messages,
+        temperature=0.4,
+    )
+
+    return response.choices[0].message["content"]
+
+def build_final_reflection(summaries):
+    joined = "\n\n---\n\n".join(
+        f"Source: {src}\nTitle: {title}\nSummary:\n{summary}"
+        for src, title, summary, link in summaries
+    )
+
+    messages = [
+        {"role": "system", "content": BRYAN_NEIDER_PROMPT},
+        {
+            "role": "user",
+            "content": (
+                "You have just written a Morning Brief with multiple AI-related summaries "
+                "for senior leaders.\n\n"
+                "Using the content below, write a single closing reflection (300–400 words) "
+                "in Bryan Neider’s voice that ties together the themes of AI, leadership, "
+                "community impact, and responsible innovation.\n\n"
+                "Do not repeat the summaries; synthesize themes and end with a hopeful, "
+                "values-driven note.\n\n"
+                f"Here are the summaries:\n\n{joined}"
+            ),
+        },
+    ]
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=messages,
+        temperature=0.4,
+    )
+
+    return response.choices[0].message["content"]
+
+def build_email(summaries, final_reflection):
+    html = """
+    <html>
+    <body style="font-family: Arial, sans-serif; padding: 20px;">
+      <h2>Morning Brief — AI Edition (Bryan Neider Style)</h2>
+      <p>This is a test run. No client email was sent.</p>
+      <hr>
+    """
+
+    for source_name, title, summary, link in summaries:
+        html += f"""
+        <h3>{source_name}: {title}</h3>
+        <p>{summary.replace('\n', '<br>')}</p>
+        <p><a href="{link}">Read full article</a></p>
+        <hr>
+        """
+
+    html += f"""
+      <h2>Closing Reflection</h2>
+      <p>{final_reflection.replace('\n', '<br>')}</p>
+    </body>
+    </html>
+    """
+    return html
+
+def send_email(to, subject, html_body):
+    msg = MIMEMultipart("alternative")
+    msg["From"] = EMAIL_USERNAME
+    msg["To"] = to
+    msg["Subject"] = subject
+    msg.attach(MIMEText(html_body, "html"))
+
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+        server.login(EMAIL_USERNAME, EMAIL_PASSWORD)
+        server.sendmail(EMAIL_USERNAME, to, msg.as_string())
+
+def is_ai_related(entry):
+    text = ((getattr(entry, "title", "") or "") + " " +
+            (getattr(entry, "summary", "") or "")).lower()
+    keywords = ["ai", "artificial intelligence", "machine learning", "genai", "chatgpt", "llm"]
+    return any(k in text for k in keywords)
+
+def run():
+    print("Fetching RSS feeds and selecting AI-related articles...")
+    summaries = []
+
+    for feed_url in RSS_FEEDS:
+        parsed = feedparser.parse(feed_url)
+        source_name = parsed.feed.get("title", feed_url)
+
+        ai_entry = None
+        for entry in parsed.entries:
+            if is_ai_related(entry):
+                ai_entry = entry
+                break
+
+        if not ai_entry:
+            print(f"No AI-related entries found for {source_name}.")
+            continue
+
+        title = ai_entry.title
+        link = ai_entry.link
+        print(f"Selected AI article from {source_name}: {title}")
+
+        text = fetch_article_text(link)
+        if not text:
+            print(f"Failed to extract article text for {link}")
+            continue
+
+        summary = summarize_article(text, source_name, title)
+        summaries.append((source_name, title, summary, link))
+
+    if not summaries:
+        print("No AI-related summaries generated; aborting email.")
+        return
+
+    final_reflection = build_final_reflection(summaries)
+    html = build_email(summaries, final_reflection)
+
+    print("Sending test email to you...")
+    send_email(NOTIFY_EMAIL, "TEST: Morning Brief — AI (Bryan Style)", html)
+    print("Done.")
+
+if __name__ == "__main__":
+    run()
